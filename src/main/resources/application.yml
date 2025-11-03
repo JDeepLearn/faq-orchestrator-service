@@ -1,0 +1,16 @@
+server:
+  port: 8080
+
+app:
+  embeddingServiceUrl: "http://localhost:8000/embed"
+  matchThreshold: 0.25
+  fallbackNumber: "1-800-123-4567"
+
+couchbase:
+  connectionString: "couchbase://localhost"
+  username: "admin"
+  password: "password"
+  bucket: "faq_bucket"
+  scope: "faq_scope"
+  kvTimeoutMs: 2500
+  queryTimeoutMs: 5000
