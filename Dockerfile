@@ -1,15 +1,28 @@
-# ---- Build Stage ----
-FROM maven:3.9-eclipse-temurin-21 AS build
+# ────────────────────────────────────────────────
+# Stage 1: Build the JAR with Maven Wrapper
+# ────────────────────────────────────────────────
+FROM eclipse-temurin:21-jdk AS builder
 WORKDIR /app
-COPY pom.xml .
-RUN mvn -q -e -B dependency:go-offline
-COPY src ./src
-RUN mvn -q -e -B clean package -DskipTests
 
-# ---- Runtime Stage ----
+COPY .mvn/ .mvn
+COPY mvnw pom.xml ./
+RUN ./mvnw -B dependency:go-offline
+
+COPY src ./src
+RUN ./mvnw -B clean package -DskipTests
+
+# ────────────────────────────────────────────────
+# Stage 2: Runtime (slim JRE)
+# ────────────────────────────────────────────────
 FROM eclipse-temurin:21-jre
-ENV JAVA_OPTS="-XX:MaxRAMPercentage=75 -XX:+UseZGC"
-WORKDIR /opt/app
-COPY --from=build /app/target/*.jar /opt/app/app.jar
+WORKDIR /app
+
+# Copy the built JAR from builder
+COPY --from=builder /app/target/*.jar app.jar
+
+# Security: non-root user
+RUN useradd spring && chown -R spring /app
+USER spring
+
 EXPOSE 8080
-ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar /opt/app/app.jar"]
+ENTRYPOINT ["java", "-jar", "/app/app.jar"]

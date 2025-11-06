@@ -1,16 +1,39 @@
-server:
-  port: 8080
+spring:
+  application:
+    name: enterprise-faq-ai
+  main:
+    banner-mode: "off"
+  messages:
+    basename: messages
 
-app:
-  embeddingServiceUrl: "http://localhost:8000/embed"
-  matchThreshold: 0.25
-  fallbackNumber: "1-800-123-4567"
+server:
+  port: ${SERVER_PORT:8080}
+  error:
+    include-message: always
+    include-binding-errors: always
 
 couchbase:
-  connectionString: "couchbase://localhost"
-  username: "admin"
-  password: "password"
-  bucket: "faq_bucket"
-  scope: "faq_scope"
-  kvTimeoutMs: 2500
-  queryTimeoutMs: 5000
+  connection-string: ${COUCHBASE_HOST:localhost}
+  username: ${COUCHBASE_USER:admin}
+  password: ${COUCHBASE_PASSWORD:password}
+  bucket: ${COUCHBASE_BUCKET:faq_bucket}
+  scope: ${COUCHBASE_SCOPE:faq_scope}
+  collection: ${COUCHBASE_COLLECTION:faqs}
+
+embedding:
+  service:
+    url: ${EMBEDDING_SERVICE_URL:http://localhost:8000/embed}
+
+faq:
+  search:
+    index-name: faq_vectors
+    vector-field-name: question_vector
+    limit: 5
+    num-candidates: 50
+  match-threshold: ${FAQ_MATCH_THRESHOLD:0.9}
+  soft-match-threshold: ${FAQ_SOFT_MATCH_THRESHOLD:0.75}
+  fallback:
+    number: ${FAQ_FALLBACK_NUMBER:1-800-123-4567}
+  hybrid:
+    semantic-weight: ${FAQ_SEMANTIC_WEIGHT:0.7}
+    lexical-weight: ${FAQ_LEXICAL_WEIGHT:0.3}

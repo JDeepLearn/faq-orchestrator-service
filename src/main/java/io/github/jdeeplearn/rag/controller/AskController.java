@@ -1,16 +1,17 @@
 package io.github.jdeeplearn.rag.controller;
 
+import io.github.jdeeplearn.rag.dto.AskRequest;
+import io.github.jdeeplearn.rag.dto.FaqResponse;
 import io.github.jdeeplearn.rag.service.FaqService;
-import io.github.jdeeplearn.rag.service.dto.AskRequest;
-import jakarta.validation.Valid;
-import jakarta.validation.constraints.NotNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.Locale;
+
 /**
- * REST controller that handles FAQ chatbot queries.
+ * REST API controller exposing /api/ask.
  */
 @RestController
 @RequestMapping("/api")
@@ -24,8 +25,11 @@ public class AskController {
     }
 
     @PostMapping("/ask")
-    public ResponseEntity<FaqService.FaqResponse> ask(@Valid @RequestBody @NotNull AskRequest request) {
-        log.info("Received question: {}", request.question());
-        return ResponseEntity.ok(faqService.answer(request.question()));
+    public ResponseEntity<FaqResponse> ask(@RequestBody AskRequest request, Locale locale) {
+        String question = request == null ? "" : request.question();
+        log.info("Received question: '{}'", question);
+        FaqResponse response = faqService.handleQuestion(question, locale);
+        log.info("Response: '{}'", response.answer());
+        return ResponseEntity.ok(response);
     }
 }

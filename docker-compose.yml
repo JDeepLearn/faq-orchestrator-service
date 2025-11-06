@@ -1,0 +1,61 @@
+services:
+  # ------------------------------------------------------------
+  # Couchbase 8.0 Server (Vector Search + FTS)
+  # ------------------------------------------------------------
+  couchbase:
+    image: couchbase:8.0
+    container_name: couchbase
+    hostname: couchbase
+    restart: unless-stopped
+    environment:
+      - COUCHBASE_ADMINISTRATOR_USERNAME=${COUCHBASE_USER}
+      - COUCHBASE_ADMINISTRATOR_PASSWORD=${COUCHBASE_PASSWORD}
+    ports:
+      - "8091-8097:8091-8097"   # Couchbase Web UI, REST, Query, Search
+      - "11210-11211:11210-11211" # Data ports
+    volumes:
+      - couchbase_data:/opt/couchbase/var
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8091/ui/index.html"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+
+  # ------------------------------------------------------------
+  # Java Spring Boot FAQ Backend
+  # ------------------------------------------------------------
+  faq-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: faq-api
+    restart: unless-stopped
+    environment:
+      - SERVER_PORT=8080
+      - COUCHBASE_HOST=couchbase
+      - COUCHBASE_USER=${COUCHBASE_USER}
+      - COUCHBASE_PASSWORD=${COUCHBASE_PASSWORD}
+      - COUCHBASE_BUCKET=${COUCHBASE_BUCKET}
+      - COUCHBASE_SCOPE=${COUCHBASE_SCOPE}
+      - COUCHBASE_COLLECTION=${COUCHBASE_COLLECTION}
+      - EMBEDDING_SERVICE_URL=http://embedding-service:5001/embed
+      - FAQ_MATCH_THRESHOLD=0.9
+      - FAQ_SOFT_MATCH_THRESHOLD=0.75
+      - FAQ_SEMANTIC_WEIGHT=0.7
+      - FAQ_LEXICAL_WEIGHT=0.3
+      - FAQ_FALLBACK_NUMBER=${FAQ_FALLBACK_NUMBER}
+    depends_on:
+      couchbase:
+        condition: service_healthy
+      embedding-service:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  couchbase_data:

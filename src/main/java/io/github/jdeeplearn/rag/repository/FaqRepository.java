@@ -1,137 +1,156 @@
 package io.github.jdeeplearn.rag.repository;
 
+import com.couchbase.client.core.error.CouchbaseException;
 import com.couchbase.client.java.Cluster;
 import com.couchbase.client.java.Collection;
-import com.couchbase.client.java.json.JsonObject;
+import com.couchbase.client.java.kv.GetOptions;
 import com.couchbase.client.java.kv.GetResult;
+import com.couchbase.client.java.search.SearchOptions;
+import com.couchbase.client.java.search.SearchQuery;
+import com.couchbase.client.java.search.SearchRequest;
+import com.couchbase.client.java.search.result.SearchResult;
+import com.couchbase.client.java.search.result.SearchRow;
+import com.couchbase.client.java.search.vector.VectorQuery;
+import com.couchbase.client.java.search.vector.VectorSearch;
+import io.github.jdeeplearn.rag.dto.FaqResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.MediaType;
-import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Repository;
-import org.springframework.web.client.RestClient;
 
-import java.nio.charset.StandardCharsets;
-import java.time.Duration;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Objects;
 
 /**
- * Repository for hybrid vector search:
- * - Vector similarity via FTS REST API (port 8094)
- * - Full document retrieval via KV get (port 11210)
+ * Repository responsible for talking to Couchbase Search Vector Index
+ * to find the best FAQ matches for a given embedding (and optional keyword).
+ * <p>
+ * This implementation uses Couchbase Java SDK 3.9.x Search APIs:
+ * - {@link SearchRequest}
+ * - {@link VectorSearch}
+ * - {@link VectorQuery}
+ * - {@link SearchOptions}
+ * <p>
+ * It does NOT use SQL++ + TEXT_SCORE / VECTOR_DISTANCE anymore,
+ * because those are brittle and caused runtime / parsing failures.
  */
 @Repository
 public class FaqRepository {
 
     private static final Logger log = LoggerFactory.getLogger(FaqRepository.class);
 
-    private final RestClient restClient;
-    private final String ftsUrl;
-    private final String username;
-    private final String password;
+    private final Collection faqCollection;
     private final Cluster cluster;
-    private final Collection collection;
+    private final String searchIndexName;
+    private final String vectorFieldName;
+    private final int limit;          // How many hits we actually retrieve
+    private final int numCandidates;  // How many candidates vector search considers
 
     public FaqRepository(
-            @Value("${couchbase.connectionString}") String connectionString,
-            @Value("${couchbase.username}") String username,
-            @Value("${couchbase.password}") String password,
-            @Value("${couchbase.bucket}") String bucketName,
-            @Value("${couchbase.scope}") String scopeName,
-            @Value("${couchbase.collection:faqs}") String collectionName,
-            @Value("${couchbase.searchPort:8094}") int searchPort) {
-
-        // Build cluster connection
-        this.cluster = Cluster.connect(connectionString, username, password);
-        this.collection = cluster.bucket(bucketName)
-                .scope(scopeName)
-                .collection(collectionName);
-
-        // Normalize host for FTS REST API
-        String hostPart = connectionString
-                .replace("couchbase://", "")
-                .replace("couchbases://", "");
-        String host = hostPart.split(",")[0].trim();
-        this.ftsUrl = "http://" + host + ":" + searchPort + "/api/index/faq_vectors/query";
-
-        this.username = username;
-        this.password = password;
-
-        SimpleClientHttpRequestFactory reqFactory = new SimpleClientHttpRequestFactory();
-        reqFactory.setConnectTimeout(3000);
-        reqFactory.setReadTimeout(6000);
-        this.restClient = RestClient.builder()
-                .requestFactory(reqFactory)
-                .build();
+            Cluster cluster,
+            Collection faqCollection,
+            @Value("${faq.search.index-name}") String searchIndexName,
+            @Value("${faq.search.vector-field-name:question_vector}") String vectorFieldName,
+            @Value("${faq.search.limit:5}") int limit,
+            @Value("${faq.search.num-candidates:50}") int numCandidates
+    ) {
+        this.cluster = Objects.requireNonNull(cluster, "cluster must not be null");
+        this.faqCollection = Objects.requireNonNull(faqCollection, "faqCollection must not be null");
+        this.searchIndexName = Objects.requireNonNull(searchIndexName, "searchIndexName must not be null");
+        this.vectorFieldName = Objects.requireNonNull(vectorFieldName, "vectorFieldName must not be null");
+        this.limit = limit;
+        this.numCandidates = numCandidates;
     }
 
     /**
-     * Executes vector search via FTS REST API, then fetches the top document from KV.
+     * Top-K “hybrid” search:
+     * - Always runs a Vector Search over {@code vectorFieldName}.
+     * - If {@code keyword} is not blank, also adds an FTS query on the question text.
+     * <p>
+     * Couchbase merges scores internally and exposes a single {@link SearchRow#score()}.
+     *
+     * @param queryVector embedding for the user question (length must match index dims).
+     * @param keyword     optional keyword / question text for lexical FTS; can be null/blank.
+     * @return ordered list of matches, highest score first (may be empty).
      */
-    public Optional<MatchResult> findBestMatch(List<Double> vector) {
+    public List<FaqMatch> findTopKHybrid(float[] queryVector, String keyword) {
+        if (queryVector == null || queryVector.length == 0) {
+            log.warn("findTopKHybrid called with empty queryVector; returning no matches.");
+            return List.of();
+        }
+
         try {
-            // FTS expects an array of knn objects
-            Map<String, Object> knnObject = Map.of(
-                    "field", "question_vector",
-                    "vector", vector,
-                    "k", 1
-            );
+            // 1) Build the VectorSearch part (required)
+            VectorQuery vectorQuery = VectorQuery
+                    .create(vectorFieldName, queryVector)
+                    .numCandidates(numCandidates);
 
-            Map<String, Object> body = new LinkedHashMap<>();
-            body.put("knn", List.of(knnObject));
-            body.put("size", 1);
+            VectorSearch vectorSearch = VectorSearch.create(vectorQuery);
 
-            String encodedAuth = Base64.getEncoder()
-                    .encodeToString((username + ":" + password).getBytes(StandardCharsets.UTF_8));
+            // 2) Build SearchRequest – vector only, or vector + FTS
+            SearchRequest request;
 
-            var responseEntity = restClient.post()
-                    .uri(ftsUrl)
-                    .contentType(MediaType.APPLICATION_JSON)
-                    .accept(MediaType.APPLICATION_JSON)
-                    .headers(h -> h.set("Authorization", "Basic " + encodedAuth))
-                    .body(body)
-                    .retrieve()
-                    .toEntity(Map.class);
-
-            Map<?, ?> respBody = responseEntity.getBody();
-            if (respBody == null) {
-                log.warn("FTS response body is null");
-                return Optional.empty();
+            if (keyword != null && !keyword.isBlank()) {
+                // Very simple lexical query on "question" field
+                // You can swap to SearchQuery.match(...) if you prefer.
+                var ftsQuery = SearchQuery.queryString(keyword);
+                request = SearchRequest
+                        .create(ftsQuery)          // FTS part
+                        .vectorSearch(vectorSearch); // plus vector
+            } else {
+                request = SearchRequest.create(vectorSearch);
             }
 
-            Object hitsObj = respBody.get("hits");
-            if (!(hitsObj instanceof List<?> hits) || hits.isEmpty()) {
-                log.info("FTS search returned no hits");
-                return Optional.empty();
+            // 3) Execute search against the vector index
+            SearchOptions options = SearchOptions
+                    .searchOptions()
+                    .limit(limit)
+                    .fields("question", "answer", "image", "link");
+
+            SearchResult result = cluster.search(searchIndexName, request, options);
+
+            // 4) Map rows → FaqMatch
+            List<FaqMatch> matches = new ArrayList<>();
+
+            for (SearchRow row : result.rows()) {
+                matches.add(new FaqMatch(
+                        row.id(),
+                        row.score()
+                ));
             }
 
-            Map<?, ?> firstHit = (Map<?, ?>) hits.get(0);
-            String docId = String.valueOf(firstHit.get("id"));
-            double score = firstHit.get("score") instanceof Number n ? n.doubleValue() : Double.NaN;
+            // 5) Sort highest score first, just in case Search didn’t already
+            matches.sort(Comparator.comparingDouble(FaqMatch::score).reversed());
 
-            // Fetch document from KV by ID
-            GetResult doc = collection.get(docId);
-            JsonObject content = doc.contentAsObject();
+            var metrics = result.metaData().metrics();
+            if (metrics != null && log.isDebugEnabled()) {
+                log.debug("FTS vector search: hits={} maxScore={} took={}us",
+                        metrics.totalRows(),
+                        metrics.maxScore(),
+                        metrics.took());
+            }
 
-            String question = content.getString("question");
-            String answer = content.getString("answer");
-            String image = content.containsKey("image") ? content.getString("image") : null;
-            String link = content.containsKey("link") ? content.getString("link") : null;
-
-            log.info("FTS+KV match: id={} score={} question='{}'", docId, score, question);
-
-            return Optional.of(new MatchResult(question, answer, image, link, score));
-
-        } catch (Exception e) {
-            log.error("Error in FTS+KV vector search", e);
-            return Optional.empty();
+            return matches;
+        } catch (CouchbaseException ex) {
+            log.error("FTS vector search failed for index='{}': {}", searchIndexName, ex, ex);
+            return List.of();
         }
     }
 
     /**
-     * Result DTO for a matched FAQ entry.
+     * Simple value object for a FAQ match.
+     * Records are concise, immutable, and great for this use-case.
      */
-    public record MatchResult(String question, String answer,
-                              String image, String link, double score) {}
+    public record FaqMatch(
+            String id,
+            double score
+    ) {
+    }
+
+    public FaqResponse getFaqDocumentById(String id) {
+        GetResult result = faqCollection.get(id, GetOptions.getOptions().project(List.of("answer", "image", "link")));
+        return result.contentAs(FaqResponse.class);
+    }
 }
